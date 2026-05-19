@@ -377,19 +377,116 @@ function ChapterReader({ manifest }: { manifest: BookReadManifest }) {
   const [currentIndex, setCurrentIndex] = useState(0);
   const [chapter, setChapter] = useState<BookChapterContent | null>(null);
   const [tocOpen, setTocOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settings, setSettings] = useState<ReaderSettings>(DEFAULT_SETTINGS);
   const [loading, setLoading] = useState(true);
+  const [chaptersLoaded, setChaptersLoaded] = useState(false);
   const [error, setError] = useState('');
+  const [ttsVoices, setTtsVoices] = useState<BookTtsVoice[]>([]);
+  const [ttsAvailable, setTtsAvailable] = useState(false);
+  const [ttsSettings, setTtsSettings] = useState<TtsSettings>(DEFAULT_TTS_SETTINGS);
+  const [ttsStatus, setTtsStatus] = useState<TtsStatus>('idle');
+  const [ttsError, setTtsError] = useState('');
+  const [ttsChunks, setTtsChunks] = useState<TtsChunk[]>([]);
+  const [ttsCurrentChunkIndex, setTtsCurrentChunkIndex] = useState(0);
+  const [ttsLoadingChunkIndex, setTtsLoadingChunkIndex] = useState<number | null>(null);
+  const [ttsBarVisible, setTtsBarVisible] = useState(false);
+  const [ttsPanelOpen, setTtsPanelOpen] = useState(false);
+  const [ttsCurrentTime, setTtsCurrentTime] = useState(0);
+  const [ttsDuration, setTtsDuration] = useState(0);
+  const [ttsSeekValue, setTtsSeekValue] = useState(0);
+  const [ttsSeeking, setTtsSeeking] = useState(false);
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const ttsChunksRef = useRef<TtsChunk[]>([]);
+  const ttsCurrentChunkIndexRef = useRef(0);
+  const ttsStatusRef = useRef<TtsStatus>('idle');
+  const ttsSettingsRef = useRef<TtsSettings>(DEFAULT_TTS_SETTINGS);
+  const ttsSeekingRef = useRef(false);
+  const ttsResumeTimeRef = useRef(0);
+  const currentChapterHref = chapters[currentIndex]?.href || '';
+  const currentChapterTitle = chapters[currentIndex]?.title || chapter?.title || '';
 
   useEffect(() => {
-    const handleToggleChapters = () => setTocOpen((prev) => !prev);
-    window.addEventListener('books-read-toggle-chapters', handleToggleChapters);
-    return () => window.removeEventListener('books-read-toggle-chapters', handleToggleChapters);
+    setSettings(loadReaderSettings());
+    setTtsSettings(loadTtsSettings());
   }, []);
 
   useEffect(() => {
-    if (!manifest.chaptersUrl && !manifest.acquisitionHref) return;
+    if (typeof window !== 'undefined') localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settings));
+  }, [settings]);
+
+  useEffect(() => {
+    if (typeof window !== 'undefined') localStorage.setItem(TTS_SETTINGS_STORAGE_KEY, JSON.stringify(ttsSettings));
+    ttsSettingsRef.current = ttsSettings;
+  }, [ttsSettings]);
+
+  useEffect(() => { ttsChunksRef.current = ttsChunks; }, [ttsChunks]);
+  useEffect(() => { ttsCurrentChunkIndexRef.current = ttsCurrentChunkIndex; }, [ttsCurrentChunkIndex]);
+  useEffect(() => { ttsStatusRef.current = ttsStatus; }, [ttsStatus]);
+  useEffect(() => { ttsSeekingRef.current = ttsSeeking; if (!ttsSeeking) setTtsSeekValue(ttsCurrentTime); }, [ttsCurrentTime, ttsSeeking]);
+
+  const stopTts = useCallback((clearQueue = false) => {
+    const audio = audioRef.current;
+    if (audio) {
+      audio.pause();
+      audio.removeAttribute('src');
+      audio.load();
+    }
+    setTtsCurrentTime(0);
+    setTtsDuration(0);
+    setTtsSeekValue(0);
+    setTtsSeeking(false);
+    setTtsLoadingChunkIndex(null);
+    setTtsStatus('idle');
+    if (clearQueue) {
+      setTtsChunks([]);
+      ttsChunksRef.current = [];
+      setTtsCurrentChunkIndex(0);
+      ttsCurrentChunkIndexRef.current = 0;
+    }
+  }, []);
+
+  useEffect(() => {
+    const handleToggleChapters = () => { setTocOpen((prev) => !prev); setSettingsOpen(false); setTtsPanelOpen(false); };
+    const handleToggleSettings = () => { setSettingsOpen((prev) => !prev); setTocOpen(false); setTtsPanelOpen(false); };
+    const handleToggleTts = () => { setTtsBarVisible((prev) => !prev); setTocOpen(false); setSettingsOpen(false); };
+    window.addEventListener('books-read-toggle-chapters', handleToggleChapters);
+    window.addEventListener('books-read-toggle-settings', handleToggleSettings);
+    window.addEventListener('books-read-toggle-tts', handleToggleTts);
+    return () => {
+      window.removeEventListener('books-read-toggle-chapters', handleToggleChapters);
+      window.removeEventListener('books-read-toggle-settings', handleToggleSettings);
+      window.removeEventListener('books-read-toggle-tts', handleToggleTts);
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch('/api/books/tts/voices')
+      .then(async (res) => {
+        const json = await res.json();
+        if (!res.ok) throw new Error(json.error || '获取朗读配置失败');
+        if (cancelled) return;
+        setTtsAvailable(true);
+        setTtsVoices(json.voices || []);
+        setTtsSettings((prev) => ({ ...prev, voice: prev.voice || json.defaults?.voice || '' }));
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          setTtsAvailable(false);
+          setTtsVoices([]);
+          setTtsError(err.message || '朗读能力不可用');
+        }
+      });
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    if (!manifest.chaptersUrl && !manifest.book.id) return;
     let cancelled = false;
     setChapters([]);
+    setChaptersLoaded(false);
     setChapter(null);
     setCurrentIndex(0);
     setLoading(true);
@@ -402,30 +499,26 @@ function ChapterReader({ manifest }: { manifest: BookReadManifest }) {
         if (cancelled) return;
         const list = (json.chapters || []) as BookChapter[];
         setChapters(list);
+        setChaptersLoaded(true);
         const savedHref = initialChapterHref || manifest.lastRecord?.chapterHref || manifest.lastRecord?.locator?.href || manifest.lastRecord?.locator?.value || '';
         const savedIndex = list.findIndex((item) => item.href === savedHref);
         setCurrentIndex(savedIndex >= 0 ? savedIndex : 0);
       })
-      .catch((err) => {
-        if (!cancelled) setError(err.message || '获取目录失败');
-      });
-    return () => {
-      cancelled = true;
-    };
+      .catch((err) => { if (!cancelled) { setError(err.message || '获取目录失败'); setChaptersLoaded(true); } });
+    return () => { cancelled = true; };
   }, [initialChapterHref, manifest]);
 
   useEffect(() => {
     const item = chapters[currentIndex];
     if (!item) {
-      if (chapters.length === 0) setLoading(false);
+      if (chaptersLoaded && chapters.length === 0) setLoading(false);
       return;
     }
+    stopTts(true);
     setLoading(true);
     setError('');
-    const params = new URLSearchParams({
-      sourceId: manifest.book.sourceId,
-      href: item.href,
-    });
+    scrollRef.current?.scrollTo({ top: 0, behavior: 'auto' });
+    const params = new URLSearchParams({ sourceId: manifest.book.sourceId, href: item.href });
     if (manifest.acquisitionHref) params.set('tocHref', manifest.acquisitionHref);
     fetch(`/api/books/read/chapter?${params.toString()}`, { cache: 'no-store' })
       .then(async (res) => {
@@ -453,10 +546,185 @@ function ChapterReader({ manifest }: { manifest: BookReadManifest }) {
       })
       .catch((err) => setError(err.message || '获取章节失败'))
       .finally(() => setLoading(false));
-  }, [chapters, currentIndex, manifest]);
+  }, [chapters, chaptersLoaded, currentIndex, manifest, stopTts]);
+
+  useEffect(() => {
+    window.dispatchEvent(new CustomEvent('books-read-update-header', {
+      detail: {
+        title: manifest.book.title,
+        subtitle: currentChapterTitle || manifest.book.author || (settings.mode === 'scrolled' ? '滚动阅读' : '翻页阅读'),
+        backHref: `/books/detail?sourceId=${encodeURIComponent(manifest.book.sourceId)}&bookId=${encodeURIComponent(manifest.book.id)}`,
+      },
+    }));
+  }, [manifest, currentChapterTitle, settings.mode]);
+
+  const goPrevChapter = useCallback(() => setCurrentIndex((prev) => Math.max(0, prev - 1)), []);
+  const goNextChapter = useCallback(() => setCurrentIndex((prev) => Math.min(chapters.length - 1, prev + 1)), [chapters.length]);
+
+  const turnPage = useCallback((direction: 1 | -1) => {
+    const node = scrollRef.current;
+    if (!node) return;
+    if (settings.mode === 'scrolled') return;
+    const delta = Math.max(240, node.clientHeight * 0.88) * direction;
+    const maxTop = Math.max(0, node.scrollHeight - node.clientHeight);
+    const nextTop = Math.max(0, Math.min(maxTop, node.scrollTop + delta));
+    if (direction > 0 && node.scrollTop >= maxTop - 8) {
+      if (currentIndex < chapters.length - 1) goNextChapter();
+      return;
+    }
+    if (direction < 0 && node.scrollTop <= 8) {
+      if (currentIndex > 0) goPrevChapter();
+      return;
+    }
+    node.scrollTo({ top: nextTop, behavior: 'smooth' });
+  }, [chapters.length, currentIndex, goNextChapter, goPrevChapter, settings.mode]);
+
+  const getChapterPlainText = useCallback(() => {
+    const html = chapter?.content || '';
+    if (!html) return '';
+    if (typeof document === 'undefined') return sanitizeTtsText(html.replace(/<[^>]*>/g, ' '));
+    const div = document.createElement('div');
+    div.innerHTML = html;
+    div.querySelectorAll('script,style,img').forEach((node) => node.remove());
+    return sanitizeTtsText(div.innerText || div.textContent || '');
+  }, [chapter]);
+
+  const fetchTtsChunkAudioUrl = useCallback(async (chunk: TtsChunk, chapterHref: string) => {
+    if (!manifest) throw new Error('书籍信息未准备好');
+    const response = await fetch('/api/books/tts/synthesize', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sourceId: manifest.book.sourceId,
+        bookId: manifest.book.id,
+        chapterHref,
+        text: chunk.text,
+        voice: ttsSettingsRef.current.voice,
+        rate: ttsSettingsRef.current.rate,
+        pitch: ttsSettingsRef.current.pitch,
+        volume: ttsSettingsRef.current.volume,
+      }),
+    });
+    const json = await response.json();
+    if (!response.ok) throw new Error(json.error || '朗读音频生成失败');
+    return URL.createObjectURL(decodeBase64Audio(json.audioBase64 || '', json.mimeType || 'audio/mpeg'));
+  }, [manifest]);
+
+  const playTtsChunk = useCallback(async (index: number) => {
+    const chunks = ttsChunksRef.current;
+    const chunk = chunks[index];
+    if (!chunk || !currentChapterHref) return;
+    try {
+      setTtsError('');
+      setTtsLoadingChunkIndex(index);
+      setTtsStatus('loading');
+      const url = await fetchTtsChunkAudioUrl(chunk, currentChapterHref);
+      if (!audioRef.current) audioRef.current = new Audio();
+      audioRef.current.src = url;
+      await audioRef.current.play();
+      ttsCurrentChunkIndexRef.current = index;
+      setTtsCurrentChunkIndex(index);
+      setTtsStatus('playing');
+      setTtsLoadingChunkIndex(null);
+    } catch (err) {
+      setTtsStatus('error');
+      setTtsLoadingChunkIndex(null);
+      setTtsError((err as Error).message || '朗读失败');
+    }
+  }, [currentChapterHref, fetchTtsChunkAudioUrl]);
+
+  const bootstrapTts = useCallback(async () => {
+    if (!ttsAvailable) return;
+    if (!currentChapterHref) {
+      setTtsError('当前章节尚未定位，稍后再试');
+      setTtsStatus('error');
+      return;
+    }
+    const text = getChapterPlainText();
+    if (!text) {
+      setTtsError('当前章节没有可朗读文本');
+      setTtsStatus('error');
+      return;
+    }
+    const chunks = chunkTtsText(text, 1200);
+    setTtsChunks(chunks);
+    ttsChunksRef.current = chunks;
+    setTtsCurrentChunkIndex(0);
+    ttsCurrentChunkIndexRef.current = 0;
+    await playTtsChunk(0);
+  }, [currentChapterHref, getChapterPlainText, playTtsChunk, ttsAvailable]);
+
+  const toggleTtsPlayback = useCallback(async () => {
+    if (!ttsAvailable) return;
+    if (ttsStatus === 'playing') {
+      audioRef.current?.pause();
+      setTtsStatus('paused');
+      return;
+    }
+    if (ttsStatus === 'paused' && audioRef.current) {
+      await audioRef.current.play();
+      setTtsStatus('playing');
+      return;
+    }
+    await bootstrapTts();
+  }, [bootstrapTts, ttsAvailable, ttsStatus]);
+
+  useEffect(() => {
+    if (!audioRef.current) audioRef.current = new Audio();
+    const audio = audioRef.current;
+    const handleEnded = () => {
+      setTtsCurrentTime(0);
+      setTtsSeekValue(0);
+      const next = ttsCurrentChunkIndexRef.current + 1;
+      if (next < ttsChunksRef.current.length) void playTtsChunk(next);
+      else setTtsStatus('idle');
+    };
+    const handleTimeUpdate = () => {
+      setTtsCurrentTime(audio.currentTime || 0);
+      setTtsDuration(audio.duration || 0);
+      if (!ttsSeekingRef.current) setTtsSeekValue(audio.currentTime || 0);
+    };
+    const handlePause = () => { if (!audio.ended && ttsStatusRef.current === 'playing') setTtsStatus('paused'); };
+    const handleLoadedMetadata = () => {
+      if (ttsResumeTimeRef.current > 0 && audio.duration > 0) audio.currentTime = Math.min(ttsResumeTimeRef.current, Math.max(0, audio.duration - 0.25));
+      ttsResumeTimeRef.current = 0;
+      setTtsDuration(audio.duration || 0);
+    };
+    audio.addEventListener('ended', handleEnded);
+    audio.addEventListener('timeupdate', handleTimeUpdate);
+    audio.addEventListener('pause', handlePause);
+    audio.addEventListener('loadedmetadata', handleLoadedMetadata);
+    return () => {
+      audio.removeEventListener('ended', handleEnded);
+      audio.removeEventListener('timeupdate', handleTimeUpdate);
+      audio.removeEventListener('pause', handlePause);
+      audio.removeEventListener('loadedmetadata', handleLoadedMetadata);
+      stopTts(true);
+    };
+  }, [playTtsChunk, stopTts]);
+
+  const selectedVoice = ttsVoices.find((item) => item.shortName === ttsSettings.voice);
+  const currentChunk = ttsChunks[ttsCurrentChunkIndex];
+  const ttsRateValue = parseSignedNumber(ttsSettings.rate, '%');
+  const ttsPitchValue = parseSignedNumber(ttsSettings.pitch, 'Hz');
+  const ttsVolumeValue = parseSignedNumber(ttsSettings.volume, '%');
+  const displayedTtsTime = ttsSeeking ? ttsSeekValue : ttsCurrentTime;
+  const ttsChunkPercent = ttsChunks.length > 0 ? ((ttsCurrentChunkIndex + 1) / ttsChunks.length) * 100 : 0;
+  const palette = THEME_STYLES[settings.theme];
 
   if (error) return <div className='p-4 text-sm text-red-500'>{error}</div>;
-  if (loading && !chapter) return <div className='p-4 text-sm text-gray-500'>章节加载中...</div>;
+  if (!chaptersLoaded || (loading && !chapter)) {
+    return (
+      <div className='flex h-[calc(100vh-3.5rem)] items-center justify-center bg-white px-4 dark:bg-gray-950'>
+        <div className='flex flex-col items-center gap-4 text-center'>
+          <div className='reader-book-loader'>
+            <BookOpen className='h-10 w-10' strokeWidth={1.75} />
+          </div>
+          <div className='text-sm text-gray-500 dark:text-gray-400'>章节加载中...</div>
+        </div>
+      </div>
+    );
+  }
   if (!chapters.length) {
     return (
       <div className='mx-auto max-w-2xl p-4'>
@@ -468,55 +736,58 @@ function ChapterReader({ manifest }: { manifest: BookReadManifest }) {
   }
 
   return (
-    <div className='min-h-[calc(100vh-3.5rem)] bg-gray-50 dark:bg-black'>
+    <div className='relative h-[calc(100vh-3.5rem)] overflow-hidden' style={{ backgroundColor: palette.panelBg, color: palette.bodyColor }}>
       {tocOpen && typeof document !== 'undefined' ? createPortal(
         <div className='fixed inset-0 z-40 bg-black/30' onClick={() => setTocOpen(false)}>
-          <div
-            className='absolute right-0 top-0 h-screen w-[22rem] max-w-[88vw] overflow-y-auto border-l border-gray-200 bg-white shadow-xl dark:border-gray-700 dark:bg-gray-950'
-            onClick={(event) => event.stopPropagation()}
-          >
-            <div className='sticky top-0 border-b border-gray-200 bg-white/95 p-4 backdrop-blur dark:border-gray-800 dark:bg-gray-950/95'>
-              <div className='text-base font-semibold'>章节目录</div>
-              <div className='mt-1 text-xs text-gray-500'>{manifest.book.title} · {chapters.length} 章</div>
-            </div>
+          <div className='absolute right-0 top-0 h-screen w-[22rem] max-w-[88vw] overflow-y-auto border-l border-gray-200 bg-white shadow-xl dark:border-gray-700 dark:bg-gray-950' onClick={(event) => event.stopPropagation()}>
             <div className='space-y-2 p-4'>
               {chapters.map((item, index) => {
                 const active = index === currentIndex;
-                return (
-                  <button
-                    key={`${item.href}-${item.order}-${index}`}
-                    onClick={() => {
-                      setCurrentIndex(index);
-                      setTocOpen(false);
-                    }}
-                    className={`block w-full rounded-2xl px-4 py-3 text-left text-sm transition ${active ? 'bg-sky-600 text-white' : 'text-gray-700 hover:bg-gray-100 dark:text-gray-200 dark:hover:bg-gray-900'}`}
-                    title={item.title}
-                  >
-                    <span className='block truncate'>{item.title}</span>
-                  </button>
-                );
+                return <button key={`${item.href}-${item.order}-${index}`} onClick={() => { setCurrentIndex(index); setTocOpen(false); }} className={`block w-full rounded-2xl px-4 py-3 text-left text-sm transition ${active ? 'bg-sky-600 text-white' : 'text-gray-700 hover:bg-gray-100 dark:text-gray-200 dark:hover:bg-gray-900'}`} title={item.title}>{item.title}</button>;
               })}
             </div>
           </div>
-        </div>,
-        document.body
+        </div>, document.body
       ) : null}
 
-      <div className='mx-auto max-w-3xl px-4 py-6'>
-        <article className='text-lg leading-9 text-gray-800 dark:text-gray-100'>
+      {settingsOpen && typeof document !== 'undefined' ? createPortal(
+        <div className='fixed inset-0 z-40 flex items-center justify-center bg-black/40 px-4' onClick={() => setSettingsOpen(false)}>
+          <div className='w-full max-w-sm rounded-3xl border border-gray-200 bg-white p-5 shadow-xl dark:border-gray-700 dark:bg-gray-950' onClick={(event) => event.stopPropagation()}>
+            <div className='mb-4'><div className='text-base font-semibold text-gray-900 dark:text-gray-100'>阅读设置</div><div className='mt-1 text-xs text-gray-500'>Legado 源支持翻页和滚动阅读</div></div>
+            <div className='space-y-6 p-1 text-sm'>
+              <div><div className='mb-2 font-medium'>阅读模式</div><div className='grid grid-cols-2 gap-2'>{([{ key: 'paginated', label: '翻页模式', desc: '左右点击翻页/章节' }, { key: 'scrolled', label: '滚动模式', desc: '上下连续滚动' }] as { key: ReaderMode; label: string; desc: string }[]).map((mode) => <button key={mode.key} onClick={() => setSettings((prev) => ({ ...prev, mode: mode.key }))} className={`rounded-2xl border px-3 py-3 text-left ${settings.mode === mode.key ? 'border-sky-500 bg-sky-50 text-sky-700 dark:bg-sky-950/30 dark:text-sky-300' : 'border-gray-200 dark:border-gray-700'}`}><div className='font-medium'>{mode.label}</div><div className='mt-1 text-xs opacity-70'>{mode.desc}</div></button>)}</div></div>
+              <div><div className='mb-2 font-medium'>主题</div><div className='grid grid-cols-3 gap-2'>{(['light', 'sepia', 'dark'] as ReaderTheme[]).map((theme) => <button key={theme} onClick={() => setSettings((prev) => ({ ...prev, theme }))} className={`rounded-2xl border px-3 py-2 ${settings.theme === theme ? 'border-sky-500 bg-sky-50 text-sky-700 dark:bg-sky-950/30 dark:text-sky-300' : 'border-gray-200 dark:border-gray-700'}`}>{theme === 'light' ? '浅色' : theme === 'sepia' ? '护眼' : '深色'}</button>)}</div></div>
+              <div><div className='mb-2 flex items-center justify-between font-medium'>字号 <span>{settings.fontSize}%</span></div><input type='range' min='85' max='140' step='5' value={settings.fontSize} onChange={(e) => setSettings((prev) => ({ ...prev, fontSize: Number(e.target.value) }))} className='w-full' /></div>
+              <div><div className='mb-2 flex items-center justify-between font-medium'>行距 <span>{settings.lineHeight.toFixed(1)}</span></div><input type='range' min='1.4' max='2.2' step='0.1' value={settings.lineHeight} onChange={(e) => setSettings((prev) => ({ ...prev, lineHeight: Number(e.target.value) }))} className='w-full' /></div>
+              <div className='flex justify-end'><button type='button' className='rounded-2xl bg-sky-600 px-4 py-2 text-sm font-medium text-white' onClick={() => setSettingsOpen(false)}>完成</button></div>
+            </div>
+          </div>
+        </div>, document.body
+      ) : null}
+
+      {settings.mode === 'paginated' && !tocOpen && !settingsOpen ? <><button aria-label='上一页' className='absolute inset-y-0 left-0 z-10 w-[28%] cursor-pointer bg-transparent' onClick={() => turnPage(-1)} /><button aria-label='下一页' className='absolute inset-y-0 right-0 z-10 w-[28%] cursor-pointer bg-transparent' onClick={() => turnPage(1)} /></> : null}
+
+      <div ref={scrollRef} className='h-full overflow-y-auto px-4 py-6' style={{ scrollSnapType: settings.mode === 'paginated' ? 'y mandatory' : undefined }}>
+        <article className='mx-auto max-w-3xl text-gray-800 dark:text-gray-100' style={{ fontSize: `${settings.fontSize}%`, lineHeight: settings.lineHeight, color: palette.bodyColor }}>
           {loading ? '加载中...' : chapter?.content?.includes('<img')
-            ? <div className='space-y-2' dangerouslySetInnerHTML={{ __html: chapter.content }} />
+            ? <div className='space-y-2 [&_img]:mx-auto [&_img]:block [&_img]:max-w-full' dangerouslySetInnerHTML={{ __html: chapter.content }} />
             : <div className='whitespace-pre-wrap'>{chapter?.content || '本章暂无内容'}</div>}
         </article>
-        <div className='mt-5 flex justify-between gap-3'>
-          <button disabled={currentIndex <= 0} onClick={() => setCurrentIndex((prev) => Math.max(0, prev - 1))} className='rounded-2xl border border-gray-200 px-4 py-2 text-sm disabled:text-gray-400 dark:border-gray-700'>上一章</button>
-          <button disabled={currentIndex >= chapters.length - 1} onClick={() => setCurrentIndex((prev) => Math.min(chapters.length - 1, prev + 1))} className='rounded-2xl bg-sky-600 px-4 py-2 text-sm text-white disabled:bg-gray-300'>下一章</button>
-        </div>
+        {settings.mode === 'scrolled' ? <div className='mx-auto mt-5 flex max-w-3xl justify-between gap-3 pb-8'><button disabled={currentIndex <= 0} onClick={goPrevChapter} className='rounded-2xl border border-gray-200 px-4 py-2 text-sm disabled:text-gray-400 dark:border-gray-700'>上一章</button><button disabled={currentIndex >= chapters.length - 1} onClick={goNextChapter} className='rounded-2xl bg-sky-600 px-4 py-2 text-sm text-white disabled:bg-gray-300'>下一章</button></div> : null}
       </div>
+
+      {ttsBarVisible ? <>
+        <div className='absolute inset-x-0 bottom-3 z-20 mx-auto w-[min(94vw,34rem)]'>
+          <div className='overflow-hidden rounded-3xl border border-gray-200 bg-white/95 shadow-xl backdrop-blur dark:border-gray-800 dark:bg-gray-950/95'>
+            <div className='px-2 pt-2'><input type='range' min={0} max={Math.max(ttsDuration, 0)} step={0.1} value={Math.min(ttsSeekValue, Math.max(ttsDuration, 0))} disabled={!ttsAvailable || ttsDuration <= 0} onPointerDown={() => setTtsSeeking(true)} onChange={(e) => setTtsSeekValue(Number(e.target.value))} onPointerUp={(e) => { const next = Number((e.target as HTMLInputElement).value); if (audioRef.current && Number.isFinite(next)) audioRef.current.currentTime = next; setTtsCurrentTime(next); setTtsSeeking(false); }} className='w-full accent-sky-500' /></div>
+            <div className='px-3 py-2.5'><div className='flex items-center gap-2'><button type='button' onClick={() => void toggleTtsPlayback()} disabled={!ttsAvailable || ttsLoadingChunkIndex !== null} className='flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-sky-600 text-white disabled:opacity-50'>{ttsLoadingChunkIndex !== null ? <Loader2 className='h-4 w-4 animate-spin' /> : ttsStatus === 'playing' ? <Pause className='h-4 w-4' /> : <Play className='h-4 w-4' />}</button><div className='min-w-0 flex-1'><div className='truncate text-sm font-medium text-gray-900 dark:text-gray-100'>{currentChapterTitle || '语音朗读'}</div><div className='mt-0.5 flex items-center gap-2 text-[11px] text-gray-500 dark:text-gray-400'><span>{!ttsAvailable ? '服务异常' : ttsStatus === 'playing' ? '正在播放' : ttsStatus === 'paused' ? '已暂停' : ttsLoadingChunkIndex !== null ? '生成语音中...' : '待播放'}</span>{ttsChunks.length > 0 ? <span>{ttsCurrentChunkIndex + 1}/{ttsChunks.length}</span> : null}</div></div><button type='button' onClick={() => setTtsPanelOpen((prev) => !prev)} className='flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-gray-100 text-gray-700 dark:bg-gray-900 dark:text-gray-200'><ChevronUp className={`h-4 w-4 transition-transform ${ttsPanelOpen ? 'rotate-180' : ''}`} /></button></div><div className='mt-2 flex items-center justify-between text-[11px] text-gray-400'><span>{selectedVoice?.displayName || '默认音色'}</span><span>{formatDurationTime(displayedTtsTime)} / {formatDurationTime(ttsDuration || 0)}</span></div></div>
+          </div>
+        </div>
+        {ttsPanelOpen ? <div className='absolute inset-x-0 bottom-20 z-30 mx-auto w-[min(94vw,34rem)]'><div className='rounded-[2rem] border border-gray-200 bg-white/98 p-4 shadow-2xl backdrop-blur dark:border-gray-800 dark:bg-gray-950/98'><div className='mb-3 flex items-center justify-between'><div className='flex items-center gap-2 text-sm font-medium text-gray-900 dark:text-gray-100'><Headphones className='h-4 w-4 text-sky-500' />听书控制</div><button type='button' onClick={() => setTtsPanelOpen(false)} className='flex h-8 w-8 items-center justify-center rounded-full bg-gray-100 text-gray-600 dark:bg-gray-900 dark:text-gray-300'><X className='h-4 w-4' /></button></div><div className='mb-4 flex items-center justify-between rounded-2xl bg-gray-50 px-3 py-2 text-xs text-gray-600 dark:bg-gray-900 dark:text-gray-300'><span className='truncate'>{currentChunk?.text.slice(0, 28) || '当前章节可开始朗读'}</span><span className='ml-2 shrink-0'>{Math.round(ttsChunkPercent)}%</span></div><select value={ttsSettings.voice} onChange={(e) => { stopTts(true); setTtsSettings((prev) => ({ ...prev, voice: e.target.value })); }} className='mb-4 w-full rounded-2xl border border-gray-200 bg-white px-3 py-2 text-sm text-gray-900 dark:border-gray-700 dark:bg-gray-950 dark:text-gray-100'>{ttsVoices.map((voice) => <option key={voice.shortName} value={voice.shortName}>{voice.displayName || voice.shortName}</option>)}</select><label className='mb-3 block text-xs text-gray-500'>语速 {ttsSettings.rate}<input type='range' min={0} max={TTS_RATE_STEPS.length - 1} step={1} value={Math.max(0, TTS_RATE_STEPS.indexOf(ttsRateValue))} onChange={(e) => { stopTts(true); setTtsSettings((prev) => ({ ...prev, rate: formatSignedValue(TTS_RATE_STEPS[Number(e.target.value)] ?? 0, '%') })); }} className='w-full' /></label><label className='mb-3 block text-xs text-gray-500'>音调 {ttsSettings.pitch}<input type='range' min={0} max={TTS_PITCH_STEPS.length - 1} step={1} value={Math.max(0, TTS_PITCH_STEPS.indexOf(ttsPitchValue))} onChange={(e) => { stopTts(true); setTtsSettings((prev) => ({ ...prev, pitch: formatSignedValue(TTS_PITCH_STEPS[Number(e.target.value)] ?? 0, 'Hz') })); }} className='w-full' /></label><label className='block text-xs text-gray-500'>音量 {ttsSettings.volume}<input type='range' min={0} max={TTS_VOLUME_STEPS.length - 1} step={1} value={Math.max(0, TTS_VOLUME_STEPS.indexOf(ttsVolumeValue))} onChange={(e) => { stopTts(true); setTtsSettings((prev) => ({ ...prev, volume: formatSignedValue(TTS_VOLUME_STEPS[Number(e.target.value)] ?? 0, '%') })); }} className='w-full' /></label>{ttsError ? <div className='mt-3 text-xs text-red-500'>{ttsError}</div> : null}</div></div> : null}
+      </> : null}
     </div>
   );
 }
-
 
 function normalizeHrefForMatch(href?: string) {
   if (!href) return '';
@@ -785,6 +1056,7 @@ export default function BookReadPage() {
 
   useEffect(() => {
     const handleToggleSettings = () => {
+      if (manifest?.format === 'chapters') return;
       setSettingsOpen((prev) => !prev);
       setTocOpen(false);
     };
@@ -793,10 +1065,11 @@ export default function BookReadPage() {
     return () => {
       window.removeEventListener('books-read-toggle-settings', handleToggleSettings);
     };
-  }, []);
+  }, [manifest?.format]);
 
   useEffect(() => {
     const handleToggleChapters = () => {
+      if (manifest?.format === 'chapters') return;
       setTocOpen((prev) => !prev);
       setSettingsOpen(false);
     };
@@ -805,10 +1078,11 @@ export default function BookReadPage() {
     return () => {
       window.removeEventListener('books-read-toggle-chapters', handleToggleChapters);
     };
-  }, []);
+  }, [manifest?.format]);
 
   useEffect(() => {
     const handleToggleTts = () => {
+      if (manifest?.format === 'chapters') return;
       setTtsBarVisible((prev) => {
         const next = !prev;
         if (!next) {
@@ -824,7 +1098,7 @@ export default function BookReadPage() {
     return () => {
       window.removeEventListener('books-read-toggle-tts', handleToggleTts);
     };
-  }, []);
+  }, [manifest?.format]);
 
 
   useEffect(() => {
